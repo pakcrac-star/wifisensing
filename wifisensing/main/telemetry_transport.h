@@ -1,56 +1,59 @@
-/**
- * @file telemetry_transport.h
- * @brief Production telemetry transport interface
- */
 
 #ifndef TELEMETRY_TRANSPORT_H
 #define TELEMETRY_TRANSPORT_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <stdint.h>
-#include "esp_err.h"
-
 typedef enum {
-    TRANSPORT_UART = 0,
-    TRANSPORT_TCP = 1,
-    TRANSPORT_UDP = 2
-} transport_mode_t;
+    TELEMETRY_MODE_USB = 0,
+    TELEMETRY_MODE_UDP = 1
+} telemetry_mode_t;
+
+// Opaque frame wrapper matching your codebase
+typedef struct {
+    uint8_t data[1024];
+    size_t length;
+} telemetry_payload_t;
 
 /**
- * @brief Initialize telemetry system
+ * @brief Initializes the telemetry transport subsystem (defaults to USB mode).
  */
-esp_err_t telemetry_transport_init(transport_mode_t mode);
+bool telemetry_transport_init(const char *server_ip, uint16_t port);
 
 /**
- * @brief Write telemetry packet
+ * @brief Dynamic runtime mode switch to Wireless UDP.
  */
-void telemetry_transport_write(const char *payload);
+esp_err_t telemetry_transport_set_udp(const char *ip_str, uint16_t port);
 
 /**
- * @brief Retrieve queued telemetry packet
+ * @brief Dynamic runtime mode switch back to USB Serial.
  */
-esp_err_t telemetry_transport_get(char *buffer, size_t max_len, uint32_t timeout_ms);
+void telemetry_transport_set_usb(void);
 
 /**
- * @brief Configure remote TCP server
+ * @brief Returns active telemetry transport mode.
  */
-esp_err_t telemetry_transport_set_tcp_remote(const char *host, uint16_t port);
+telemetry_mode_t telemetry_transport_get_mode(void);
 
 /**
- * @brief Get current transport mode
+ * @brief Sends telemetry payload over the currently active transport (USB or UDP).
  */
-transport_mode_t telemetry_transport_get_mode(void);
+int telemetry_transport_send(const void *payload, size_t size);
 
 /**
- * @brief Get queue fill level
+ * @brief Cleanly shuts down active socket connections.
  */
-uint32_t telemetry_transport_queue_level(void);
+void telemetry_transport_deinit(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* TELEMETRY_TRANSPORT_H */
+#endif // TELEMETRY_TRANSPORT_H
