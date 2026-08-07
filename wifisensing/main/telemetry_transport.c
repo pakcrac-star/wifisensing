@@ -1,127 +1,143 @@
-/**
- * @file telemetry_transport.c
- * @brief Production-grade multi-transport telemetry backend
- * @note Supports UART, TCP/IP (active mode), and local UDP logging
- */
-
 #include "telemetry_transport.h"
+
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <lwip/sockets.h>
+
 #include "esp_log.h"
-#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
-#define TAG "TELEMETRY"
-#define TELEMETRY_QUEUE_SIZE 32
-#define TELEMETRY_PAYLOAD_MAX 1024
+static const char *TAG = "TELEMETRY_TRANSPORT";
 
-typedef enum {
-    TRANSPORT_UART,
-    TRANSPORT_TCP,
-    TRANSPORT_UDP
-} transport_mode_t;
+static int s_sock = -1;
+static struct sockaddr_in s_dest_addr;
+static telemetry_mode_t s_active_mode = TELEMETRY_MODE_USB;
+static SemaphoreHandle_t s_transport_lock = NULL;
 
-static transport_mode_t g_transport_mode = TRANSPORT_UART;
-static QueueHandle_t telemetry_queue = NULL;
-static char telemetry_buffer[TELEMETRY_PAYLOAD_MAX];
+// Binary Sync Word for USB output stream
+static const uint8_t SYNC_WORD[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 
-/**
- * @brief Initialize telemetry transport queue and logging
- */
-esp_err_t telemetry_transport_init(transport_mode_t mode)
+bool telemetry_transport_init(const char *server_ip, uint16_t port)
 {
-    g_transport_mode = mode;
-    
-    if (telemetry_queue == NULL) {
-        telemetry_queue = xQueueCreate(TELEMETRY_QUEUE_SIZE, TELEMETRY_PAYLOAD_MAX);
-        if (telemetry_queue == NULL) {
-            ESP_LOGE(TAG, "Failed to create telemetry queue");
-            return ESP_ERR_NO_MEM;
-        }
+    if (s_transport_lock == NULL) {
+        s_transport_lock = xSemaphoreCreateMutex();
     }
-    
-    ESP_LOGI(TAG, "Telemetry transport initialized (mode=%d)", (int)mode);
+
+    // Disable stdout buffering for immediate USB streaming
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    // If initial IP provided, attempt UDP configuration, otherwise stay USB
+    if (server_ip && strlen(server_ip) > 0 && strcmp(server_ip, "0.0.0.0") != 0) {
+        telemetry_transport_set_udp(server_ip, port);
+    } else {
+        telemetry_transport_set_usb();
+    }
+
+    return true;
+}
+
+esp_err_t telemetry_transport_set_udp(const char *ip_str, uint16_t port)
+{
+    if (!ip_str || port == 0) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+
+    // Close existing socket if open
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
+    }
+
+    memset(&s_dest_addr, 0, sizeof(s_dest_addr));
+    s_dest_addr.sin_family = AF_INET;
+    s_dest_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip_str, &s_dest_addr.sin_addr);
+
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create UDP socket (errno %d). Falling back to USB.", errno);
+        s_active_mode = TELEMETRY_MODE_USB;
+        xSemaphoreGive(s_transport_lock);
+        return ESP_FAIL;
+    }
+
+    // Set non-blocking socket so packet drops never delay the CSI pipeline
+    int flags = fcntl(s_sock, F_GETFL, 0);
+    fcntl(s_sock, F_SETFL, flags | O_NONBLOCK);
+
+    s_active_mode = TELEMETRY_MODE_UDP;
+    ESP_LOGI(TAG, "-> Switched Active Transport to UDP Wireless [%s:%d]", ip_str, port);
+
+    xSemaphoreGive(s_transport_lock);
     return ESP_OK;
 }
 
-/**
- * @brief Write payload to configured transport
- */
-void telemetry_transport_write(const char *payload)
+void telemetry_transport_set_usb(void)
 {
-    if (payload == NULL) {
-        return;
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
     }
 
-    size_t len = strlen(payload);
-    if (len > TELEMETRY_PAYLOAD_MAX - 1) {
-        ESP_LOGW(TAG, "Payload exceeds buffer size (%zu > %d)", len, TELEMETRY_PAYLOAD_MAX - 1);
-        len = TELEMETRY_PAYLOAD_MAX - 1;
+    s_active_mode = TELEMETRY_MODE_USB;
+    ESP_LOGI(TAG, "-> Switched Active Transport to USB Serial Cable Mode");
+
+    xSemaphoreGive(s_transport_lock);
+}
+
+telemetry_mode_t telemetry_transport_get_mode(void)
+{
+    return s_active_mode;
+}
+
+int telemetry_transport_send(const void *payload, size_t size)
+{
+    if (unlikely(payload == NULL || size == 0)) return -1;
+
+    // ---------------------------------------------------------
+    // MODE 1: USB Serial Mode (Default / Cable Attached)
+    // ---------------------------------------------------------
+    if (s_active_mode == TELEMETRY_MODE_USB) {
+        fwrite(SYNC_WORD, 1, sizeof(SYNC_WORD), stdout);
+        uint16_t frame_size = (uint16_t)size;
+        fwrite(&frame_size, 1, sizeof(frame_size), stdout);
+        size_t written = fwrite(payload, 1, size, stdout);
+        fflush(stdout);
+        return (int)written;
     }
 
-    // Queue for async processing
-    if (telemetry_queue != NULL) {
-        strncpy(telemetry_buffer, payload, len);
-        telemetry_buffer[len] = '\0';
-        
-        if (xQueueSend(telemetry_queue, telemetry_buffer, pdMS_TO_TICKS(10)) != pdPASS) {
-            ESP_LOGW(TAG, "Telemetry queue full, dropping packet");
+    // ---------------------------------------------------------
+    // MODE 2: Wireless UDP Mode (Detached / Network Streaming)
+    // ---------------------------------------------------------
+    if (s_active_mode == TELEMETRY_MODE_UDP && s_sock >= 0) {
+        int bytes_sent = sendto(s_sock, payload, size, 0,
+                               (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
+        if (bytes_sent > 0) return bytes_sent;
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0; // Buffer full, drop frame silently to prevent lagging
         }
     }
 
-    // Always log to UART (debug)
-    printf("%s\n", payload);
+    return -1;
 }
 
-/**
- * @brief Get next telemetry packet from queue (blocking)
- * @return ESP_OK on success, ESP_ERR_TIMEOUT if no data available
- */
-esp_err_t telemetry_transport_get(char *buffer, size_t max_len, uint32_t timeout_ms)
+void telemetry_transport_deinit(void)
 {
-    if (buffer == NULL || telemetry_queue == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
     }
-
-    if (xQueueReceive(telemetry_queue, buffer, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-        return ESP_OK;
-    }
-    
-    return ESP_ERR_TIMEOUT;
-}
-
-/**
- * @brief Configure TCP/IP transport (active mode)
- */
-esp_err_t telemetry_transport_set_tcp_remote(const char *host, uint16_t port)
-{
-    if (host == NULL || port == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Store for future TCP connection handling
-    g_transport_mode = TRANSPORT_TCP;
-    ESP_LOGI(TAG, "TCP transport configured: %s:%u", host, port);
-    
-    return ESP_OK;
-}
-
-/**
- * @brief Get current transport mode
- */
-transport_mode_t telemetry_transport_get_mode(void)
-{
-    return g_transport_mode;
-}
-
-/**
- * @brief Get queue fill level for diagnostics
- */
-uint32_t telemetry_transport_queue_level(void)
-{
-    if (telemetry_queue == NULL) {
-        return 0;
-    }
-    return uxQueueMessagesWaiting(telemetry_queue);
+    s_active_mode = TELEMETRY_MODE_USB;
+    xSemaphoreGive(s_transport_lock);
 }
