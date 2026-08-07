@@ -38,9 +38,7 @@
  * Fallbacks & Guarded Definitions
  * ========================================================================= */
 
-#ifndef WIFI_CSI_MODE_PASSIVE
-#define WIFI_CSI_MODE_PASSIVE 2
-#endif
+
 
 #ifndef CONFIG_CSI_MAX_SAMPLES
 #define CONFIG_CSI_MAX_SAMPLES 384
@@ -110,7 +108,9 @@ static hal_state_t s_hal = {0};
 
 static inline bool is_passive_mode(wifi_csi_mode_t mode)
 {
-    return (mode == WIFI_CSI_MODE_PASSIVE || mode == WIFI_CSI_MODE_UNKNOWN);
+    // Passive observer mode is represented by WIFI_CSI_MODE_UNKNOWN (0).
+    // Do NOT treat WIFI_CSI_MODE_HYBRID as passive here.
+    return (mode == WIFI_CSI_MODE_UNKNOWN);
 }
 
 /* =========================================================================
