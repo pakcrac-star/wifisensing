@@ -28,7 +28,7 @@ use crate::FloatExt;
 use crate::types::ComplexF32;
 
 /// Maximum subcarriers supported matching upstream architecture (`MAX_SUBCARRIERS = 256`)
-pub const MAX_SUBCARRIERS: usize = 256;
+pub const MAX_SUBCARRIERS: usize = 384;
 
 /// Epsilon to prevent log(0) and division by zero in dynamic range calculations
 const EPSILON: f32 = 1e-9;
