@@ -1,14 +1,30 @@
-/**
- * @file main.c
- * @brief System Orchestrator and Boot Menu for ESP32-S3 Wi-Fi Sensing.
+/*
+ * main.c
+ * System Orchestrator + integrated telemetry (USB/UDP) for ESP32-S3 Wi‑Fi Sensing.
+ *
+ * This version inlines the telemetry transport and local shared FFI type definitions
+ * so the project can build without telemetry_transport.{c,h} or wifi_csi.h.
+ *
+ * IMPORTANT:
+ * - Ensure the struct layouts below exactly match rust_engine/src/types.rs (repr(C)).
+ * - Adjust CSI_MAX_SAMPLES if you changed it in Rust.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -16,40 +32,257 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 
-#include "wifi_csi.h"
-#include "telemetry_transport.h"
+static const char *TAG = "ORCHESTRATOR";
 
-static const char *TAG __attribute__((unused)) = "ORCHESTRATOR";
+/* --------------------------------------------------------------------------
+ * Shared constants & FFI types (must match Rust repr(C) layout exactly)
+ * ------------------------------------------------------------------------*/
+#define CSI_MAX_SAMPLES 384
 
-/* =========================================================================
- * External FFI Declarations (Bridges to Rust & Telemetry)
- * ========================================================================= */
+typedef struct {
+    uint64_t timestamp_us;
+    uint8_t  mac_address[6];
+    int8_t   rssi;
+    int8_t   noise_floor;
+    uint8_t  channel;
+    uint8_t  bandwidth;
+    uint8_t  phy_mode;
+    uint16_t csi_length;
+    uint8_t  csi_data[CSI_MAX_SAMPLES];
+} csi_frame_t;
 
+/* Keep the field order in sync with rust_engine/src/types.rs::MetadataFrame */
+typedef struct {
+    uint64_t timestamp_us;
+    uint8_t  bssid[6];
+    char     ssid[33];
+    int8_t   rssi;
+    uint8_t  channel;
+    uint8_t  security_type;
+    uint8_t  phy_mode;
+    uint8_t  bandwidth;
+    int8_t   noise;
+    uint16_t beacon_interval;
+} metadata_frame_t;
+
+typedef enum {
+    WIFI_CSI_MODE_UNKNOWN = 0,
+    WIFI_CSI_MODE_KNOWN,
+    WIFI_CSI_MODE_HYBRID
+} wifi_csi_mode_t;
+
+typedef struct {
+    wifi_csi_mode_t mode;
+    char ssid[33];
+    char password[65];
+} app_wifi_csi_config_t;
+
+typedef struct {
+    volatile uint32_t csi_frames_received;
+    volatile uint32_t dropped_frames;
+    volatile uint32_t invalid_frames;
+    uint32_t reconnect_count;
+    uint32_t disconnect_count;
+    uint32_t scan_count;
+} wifi_csi_stats_t;
+
+/* --------------------------------------------------------------------------
+ * External (remaining) FFI hooks implemented elsewhere in the project
+ * - rust_engine_xxx are in the Rust engine (lib with #[no_mangle] symbols)
+ * - wifi_csi_hal_xxx and pop APIs are implemented by wifi_csi.c (still present)
+ * ------------------------------------------------------------------------*/
 extern void rust_engine_init(void);
 extern void rust_engine_push_csi(const csi_frame_t *frame);
 extern void rust_engine_push_metadata(const metadata_frame_t *meta);
 
-/* =========================================================================
- * Global State for Hybrid Mode Gating
- * ========================================================================= */
+extern esp_err_t wifi_csi_hal_init(const app_wifi_csi_config_t *config);
+extern esp_err_t wifi_csi_hal_start(void);
+extern bool wifi_csi_pop_frame(csi_frame_t *out_frame, uint32_t timeout_ms);
+extern bool wifi_csi_pop_metadata(metadata_frame_t *out_meta, uint32_t timeout_ms);
+extern void wifi_csi_get_stats(wifi_csi_stats_t *out_stats);
+extern void wifi_csi_reset_stats(void);
 
+/* --------------------------------------------------------------------------
+ * Inlined Telemetry Transport (USB framing to stdout + non-blocking UDP)
+ * - thread-safe via s_transport_lock
+ * - API mirrors prior telemetry_transport.h semantics used by main.c
+ * ------------------------------------------------------------------------*/
+typedef enum { TELEMETRY_MODE_USB = 0, TELEMETRY_MODE_UDP = 1 } telemetry_mode_t;
+
+static int s_sock = -1;
+static struct sockaddr_in s_dest_addr;
+static telemetry_mode_t s_active_mode = TELEMETRY_MODE_USB;
+static SemaphoreHandle_t s_transport_lock = NULL;
+
+/* Binary sync word for USB framed output */
+static const uint8_t SYNC_WORD[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+/* Initialize telemetry subsystem (must be called early) */
+static bool telemetry_init(const char *server_ip, uint16_t port)
+{
+    if (s_transport_lock == NULL) {
+        s_transport_lock = xSemaphoreCreateMutex();
+        if (s_transport_lock == NULL) {
+            ESP_LOGE(TAG, "telemetry_init: failed to create mutex");
+            return false;
+        }
+    }
+
+    /* Disable stdout buffering for immediate USB streaming */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    if (server_ip && server_ip[0] != '\0' && strcmp(server_ip, "0.0.0.0") != 0) {
+        /* attempt UDP */
+        // reuse telemetry_set_udp below for consistency
+    } else {
+        /* remain in USB mode */
+    }
+
+    /* start in USB mode by default; optionally configure UDP below */
+    s_active_mode = TELEMETRY_MODE_USB;
+    s_sock = -1;
+    memset(&s_dest_addr, 0, sizeof(s_dest_addr));
+    return true;
+}
+
+static esp_err_t telemetry_set_udp(const char *ip_str, uint16_t port)
+{
+    if (!ip_str || port == 0) return ESP_ERR_INVALID_ARG;
+    if (!s_transport_lock) return ESP_ERR_INVALID_STATE;
+
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+
+    /* Close previous socket if any */
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
+    }
+
+    memset(&s_dest_addr, 0, sizeof(s_dest_addr));
+    s_dest_addr.sin_family = AF_INET;
+    s_dest_addr.sin_port = htons(port);
+
+    int pton = inet_pton(AF_INET, ip_str, &s_dest_addr.sin_addr);
+    if (pton != 1) {
+        ESP_LOGE(TAG, "telemetry_set_udp: invalid IP '%s'", ip_str);
+        xSemaphoreGive(s_transport_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_sock < 0) {
+        ESP_LOGE(TAG, "telemetry_set_udp: socket() failed errno=%d", errno);
+        s_active_mode = TELEMETRY_MODE_USB;
+        xSemaphoreGive(s_transport_lock);
+        return ESP_FAIL;
+    }
+
+    int flags = fcntl(s_sock, F_GETFL, 0);
+    if (flags >= 0) {
+        if (fcntl(s_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            ESP_LOGW(TAG, "telemetry_set_udp: fcntl set O_NONBLOCK failed (errno=%d)", errno);
+            /* not fatal, continue */
+        }
+    }
+
+    s_active_mode = TELEMETRY_MODE_UDP;
+    ESP_LOGI(TAG, "Telemetry -> UDP [%s:%d]", ip_str, port);
+
+    xSemaphoreGive(s_transport_lock);
+    return ESP_OK;
+}
+
+static void telemetry_set_usb(void)
+{
+    if (!s_transport_lock) return;
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
+    }
+    s_active_mode = TELEMETRY_MODE_USB;
+    ESP_LOGI(TAG, "Telemetry -> USB (stdout)");
+
+    xSemaphoreGive(s_transport_lock);
+}
+
+static telemetry_mode_t telemetry_get_mode(void)
+{
+    telemetry_mode_t mode = TELEMETRY_MODE_USB;
+    if (!s_transport_lock) return mode;
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+    mode = s_active_mode;
+    xSemaphoreGive(s_transport_lock);
+    return mode;
+}
+
+/* Send telemetry payload. Returns bytes written, 0 if dropped, -1 on error. */
+static int telemetry_send(const void *payload, size_t size)
+{
+    if (!payload || size == 0) return -1;
+    if (!s_transport_lock) return -1;
+
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+
+    if (s_active_mode == TELEMETRY_MODE_USB) {
+        /* Frame to stdout: [SYNC_WORD(4)][len(2)][payload] */
+        size_t nw = fwrite(SYNC_WORD, 1, sizeof(SYNC_WORD), stdout);
+        (void)nw;
+        uint16_t frame_size = (uint16_t)size;
+        fwrite(&frame_size, 1, sizeof(frame_size), stdout);
+        size_t written = fwrite(payload, 1, size, stdout);
+        fflush(stdout);
+        xSemaphoreGive(s_transport_lock);
+        return (int)written;
+    }
+
+    if (s_active_mode == TELEMETRY_MODE_UDP && s_sock >= 0) {
+        int bytes_sent = sendto(s_sock, payload, size, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
+        if (bytes_sent > 0) {
+            xSemaphoreGive(s_transport_lock);
+            return bytes_sent;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* drop silently to avoid blocking pipeline */
+            xSemaphoreGive(s_transport_lock);
+            return 0;
+        }
+        ESP_LOGW(TAG, "telemetry_send: sendto failed errno=%d", errno);
+    }
+
+    xSemaphoreGive(s_transport_lock);
+    return -1;
+}
+
+static void telemetry_deinit(void)
+{
+    if (!s_transport_lock) return;
+    xSemaphoreTake(s_transport_lock, portMAX_DELAY);
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
+    }
+    s_active_mode = TELEMETRY_MODE_USB;
+    xSemaphoreGive(s_transport_lock);
+}
+
+/* --------------------------------------------------------------------------
+ * Orchestrator: main app logic (largely unchanged)
+ * ------------------------------------------------------------------------*/
 static volatile bool g_is_hybrid_mode = false;
 static volatile bool g_hybrid_permission_granted = false;
 
-/* =========================================================================
- * Serial Monitor I/O Helpers
- * ========================================================================= */
-
+/* Serial readline helper (non-blocking-ish) */
 static void serial_readline(char *buf, size_t max_len)
 {
     size_t count = 0;
     while (count < max_len - 1) {
         int c = getchar();
         if (c == '\n' || c == '\r') {
-            if (count > 0) {
-                break;
-            }
+            if (count > 0) break;
         } else if (c != EOF) {
             buf[count++] = (char)c;
             putchar(c);
@@ -61,16 +294,13 @@ static void serial_readline(char *buf, size_t max_len)
     printf("\n");
 }
 
-/* =========================================================================
- * Wi-Fi Scanning & Selection Menu
- * ========================================================================= */
-
+/* Local AP scanner menu; uses esp_wifi APIs */
 static void run_ap_scanner_menu(char *out_ssid, char *out_password)
 {
     printf("\n--- Starting Temporary Wi-Fi Scanner ---\n");
 
     esp_netif_t *temp_netif = esp_netif_create_default_wifi_sta();
-    
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -112,6 +342,11 @@ static void run_ap_scanner_menu(char *out_ssid, char *out_password)
             serial_readline(out_password, 64);
 
             free(ap_records);
+        } else {
+            /* allocation failed: fallback to empty */
+            out_ssid[0] = '\0';
+            out_password[0] = '\0';
+            ESP_LOGW(TAG, "run_ap_scanner_menu: malloc failed, using empty SSID");
         }
     }
 
@@ -120,14 +355,11 @@ static void run_ap_scanner_menu(char *out_ssid, char *out_password)
     if (temp_netif) {
         esp_netif_destroy_default_wifi(temp_netif);
     }
-    
+
     printf("--- Scanner Teardown Complete ---\n\n");
 }
 
-/* =========================================================================
- * Data Router Task (Pinned safely to Core 1)
- * ========================================================================= */
-
+/* Data router task (pins to Core 1 in app_main) */
 static void data_router_task(void *pvParameters)
 {
     static csi_frame_t csi;
@@ -141,9 +373,8 @@ static void data_router_task(void *pvParameters)
         bool active_work = false;
 
         if (wifi_csi_pop_frame(&csi, 10)) {
-            // push to rust + send telemetry
             rust_engine_push_csi(&csi);
-            telemetry_transport_send(&csi, sizeof(csi));
+            telemetry_send(&csi, sizeof(csi));
             active_work = true;
             pop_count++;
             send_count++;
@@ -156,7 +387,6 @@ static void data_router_task(void *pvParameters)
             active_work = true;
         }
 
-        // periodic log every 5s (non-ISR)
         if ((xTaskGetTickCount() - last_log) > pdMS_TO_TICKS(5000)) {
             wifi_csi_stats_t stats_snapshot;
             memset(&stats_snapshot, 0, sizeof(stats_snapshot));
@@ -177,10 +407,8 @@ static void data_router_task(void *pvParameters)
         }
     }
 }
-/*=========================================================================
- * USB C2 Command Parser & Background Task
- * ========================================================================= */
 
+/* CLI command parser */
 static void parse_and_execute(char *cmd)
 {
     cmd[strcspn(cmd, "\r\n")] = 0;
@@ -237,7 +465,7 @@ static void parse_and_execute(char *cmd)
         if (parsed < 1) parsed = sscanf(cmd, "wifi_prod %31[^:]:%hu", ip, &port);
 
         if (parsed >= 1) {
-            if (telemetry_transport_set_udp(ip, port) == ESP_OK) {
+            if (telemetry_set_udp(ip, port) == ESP_OK) {
                 printf("[CLI_OK] Output target set to UDP Wireless: %s:%d\n", ip, port);
                 printf("[INFO] You can now safely detach the USB cable!\n");
             } else {
@@ -250,7 +478,7 @@ static void parse_and_execute(char *cmd)
     }
 
     if (strcmp(cmd, "usb_mode") == 0) {
-        telemetry_transport_set_usb();
+        telemetry_set_usb();
         printf("[CLI_OK] Telemetry switched to USB Cable Mode.\n");
         return;
     }
@@ -258,7 +486,7 @@ static void parse_and_execute(char *cmd)
     if (strcmp(cmd, "status") == 0) {
         wifi_ap_record_t ap_info;
         printf("=== SYSTEM STATUS ===\n");
-        printf("Transport Mode: %s\n", (telemetry_transport_get_mode() == TELEMETRY_MODE_USB) ? "USB SERIAL" : "UDP WIRELESS");
+        printf("Transport Mode: %s\n", (telemetry_get_mode() == TELEMETRY_MODE_USB) ? "USB SERIAL" : "UDP WIRELESS");
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
             printf("Wi-Fi Status: CONNECTED to '%s' (RSSI: %d dBm)\n", ap_info.ssid, ap_info.rssi);
         } else {
@@ -294,10 +522,7 @@ static void usb_cli_task(void *pvParameters)
     }
 }
 
-/* =========================================================================
- * Application Entry Point
- * ========================================================================= */
-
+/* Application entrypoint */
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -313,6 +538,7 @@ void app_main(void)
     printf("==========================================\n");
     printf(" ESP32-S3 Wi-Fi CSI Sensing Orchestrator\n");
     printf("==========================================\n");
+
     printf("Select Operating Mode:\n");
     printf("[1] Unknown Wi-Fi (Passive Sensing, No Password)\n");
     printf("[2] Known Wi-Fi (Connected, Traditional CSI)\n");
@@ -328,8 +554,7 @@ void app_main(void)
     if (mode_choice == 1) {
         printf("\n=> Starting in UNKNOWN (Passive) Mode\n");
         hal_config.mode = WIFI_CSI_MODE_UNKNOWN;
-    } 
-    else if (mode_choice == 2 || mode_choice == 3) {
+    } else if (mode_choice == 2 || mode_choice == 3) {
         if (mode_choice == 3) {
             printf("\n=> Starting in HYBRID Mode (Requires 'grant' via Serial)\n");
             hal_config.mode = WIFI_CSI_MODE_HYBRID;
@@ -345,28 +570,27 @@ void app_main(void)
 
         strncpy(hal_config.ssid, target_ssid, sizeof(hal_config.ssid));
         strncpy(hal_config.password, target_pass, sizeof(hal_config.password));
-    } 
-    else {
+    } else {
         printf("\nInvalid choice. Rebooting...\n");
         esp_restart();
     }
 
     printf("\nInitializing Subsystems...\n");
-    
-    // Default strictly to USB mode
-    telemetry_transport_init("0.0.0.0", 3333);
 
-    // Init Rust Engine (Core 1)
+    /* Initialize telemetry to USB by default (0.0.0.0 -> USB) */
+    telemetry_init("0.0.0.0", 3333);
+
+    /* Initialize Rust engine (no-op if not implemented) */
     rust_engine_init();
 
-    // Init Radio HAL
+    /* Initialize Radio HAL (wifi_csi.c) */
     ESP_ERROR_CHECK(wifi_csi_hal_init(&hal_config));
     ESP_ERROR_CHECK(wifi_csi_hal_start());
 
-    // Spawn Data Router Task pinned to Core 1 (leaving Core 0 free for Wi-Fi stack)
+    /* Spawn Data Router pinned to core 1 */
     xTaskCreatePinnedToCore(data_router_task, "data_router", 8192, NULL, 5, NULL, 1);
 
-    // Spawn USB CLI Command Task
+    /* Spawn USB CLI Task */
     xTaskCreate(usb_cli_task, "usb_cli_task", 4096, NULL, 5, NULL);
 
     printf("==========================================\n");
