@@ -133,17 +133,22 @@ static void data_router_task(void *pvParameters)
     static csi_frame_t csi;
     static metadata_frame_t meta;
 
+    uint32_t pop_count = 0;
+    uint32_t send_count = 0;
+    TickType_t last_log = xTaskGetTickCount();
+
     while (1) {
         bool active_work = false;
 
-        // 1. Route High-Speed CSI
         if (wifi_csi_pop_frame(&csi, 10)) {
+            // push to rust + send telemetry
             rust_engine_push_csi(&csi);
             telemetry_transport_send(&csi, sizeof(csi));
             active_work = true;
+            pop_count++;
+            send_count++;
         }
 
-        // 2. Route Slow-Path Metadata
         if (wifi_csi_pop_metadata(&meta, 10)) {
             if (!g_is_hybrid_mode || g_hybrid_permission_granted) {
                 rust_engine_push_metadata(&meta);
@@ -151,16 +156,28 @@ static void data_router_task(void *pvParameters)
             active_work = true;
         }
 
-        // Yield control to prevent watchdog starvation and high CPU heat
+        // periodic log every 5s (non-ISR)
+        if ((xTaskGetTickCount() - last_log) > pdMS_TO_TICKS(5000)) {
+            wifi_csi_stats_t stats_snapshot;
+            memset(&stats_snapshot, 0, sizeof(stats_snapshot));
+            wifi_csi_get_stats(&stats_snapshot);
+
+            ESP_LOGI("DATA_ROUTER", "popped=%u sent=%u dropped=%u",
+                     (unsigned)pop_count,
+                     (unsigned)send_count,
+                     (unsigned)stats_snapshot.dropped_frames);
+
+            last_log = xTaskGetTickCount();
+        }
+
         if (!active_work) {
             vTaskDelay(pdMS_TO_TICKS(10));
         } else {
-            vTaskDelay(1);
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 }
-
-/* =========================================================================
+/*=========================================================================
  * USB C2 Command Parser & Background Task
  * ========================================================================= */
 
