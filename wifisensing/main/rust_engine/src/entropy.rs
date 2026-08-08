@@ -4,7 +4,7 @@
 //! ============================================================================
 
 /// Maximum subcarriers supported across 20MHz/40MHz OFDM frames
-pub const MAX_SUBCARRIERS: usize = 256;
+pub const MAX_SUBCARRIERS: usize = 384;
 
 /// Temporal window size for computing time-series entropy
 pub const TEMPORAL_WINDOW_SIZE: usize = 32;
