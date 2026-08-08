@@ -29,7 +29,7 @@ use crate::FloatExt;
 pub const DOPPLER_WINDOW_SIZE: usize = 32;
 
 /// Maximum number of subcarriers processed
-pub const MAX_SUBCARRIERS: usize = 256;
+pub const MAX_SUBCARRIERS: usize = 384;
 
 /// Standard Wi-Fi wavelengths in meters
 pub const WAVELENGTH_2_4GHZ: f32 = 0.1249_f32; // 2.412 - 2.484 GHz
