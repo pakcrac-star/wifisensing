@@ -3,7 +3,7 @@
 #include <string.h>
 #include <math.h>
 
-#define FEATURE_DIM 5
+#define FEATURE_DIM 16
 #define NUM_CLASSES 4
 
 // Maps 1:1 with `Tensor<N>` layout in Rust (repr(C) contiguous f32 array)
@@ -23,18 +23,18 @@ typedef struct {
 
 // -----------------------------------------------------------------------------
 // EMBEDDED NEURAL NETWORK WEIGHTS (Pre-trained Fixed Point / Float Parameters)
-// Architecture: Input (5) -> Dense Hidden Layer (8, ReLU) -> Output (4, Softmax)
+// Architecture: Input (16) -> Dense Hidden Layer (8, ReLU) -> Output (4, Softmax)
 // -----------------------------------------------------------------------------
 
 static const float HIDDEN_WEIGHTS[8][FEATURE_DIM] = {
-    {  0.42f, -1.12f,  0.85f,  0.31f, -0.05f },
-    { -0.89f,  0.45f, -0.22f,  1.05f,  0.64f },
-    {  0.12f,  0.95f, -1.43f, -0.15f,  0.22f },
-    {  1.10f,  0.15f,  0.33f, -0.82f, -0.41f },
-    { -0.33f, -0.75f,  0.91f,  0.44f,  0.82f },
-    {  0.65f, -0.22f, -0.61f, -1.15f, -0.09f },
-    { -0.05f,  1.20f,  0.45f,  0.11f, -0.92f },
-    {  0.81f, -0.55f, -0.12f,  0.72f,  0.45f }
+    {  0.42f, -1.12f,  0.85f,  0.31f, -0.05f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    { -0.89f,  0.45f, -0.22f,  1.05f,  0.64f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    {  0.12f,  0.95f, -1.43f, -0.15f,  0.22f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    {  1.10f,  0.15f,  0.33f, -0.82f, -0.41f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    { -0.33f, -0.75f,  0.91f,  0.44f,  0.82f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    {  0.65f, -0.22f, -0.61f, -1.15f, -0.09f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    { -0.05f,  1.20f,  0.45f,  0.11f, -0.92f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f },
+    {  0.81f, -0.55f, -0.12f,  0.72f,  0.45f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f,  0.00f }
 };
 
 static const float HIDDEN_BIASES[8] = {
